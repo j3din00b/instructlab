@@ -32,7 +32,7 @@ evaluate:
   # Base taxonomy branch
   # Default: None
   base_branch:
-  # Directory where model to be used for evaluation is stored.
+  # Base model to compare with 'model' for mt_bench_branch and mmlu_branch.
   # Default: instructlab/granite-7b-lab
   base_model: instructlab/granite-7b-lab
   # Taxonomy branch containing custom skills/knowledge that should be used for
@@ -58,17 +58,18 @@ evaluate:
     # Directory where custom MMLU tasks are stored.
     # Default: /data/instructlab/datasets
     tasks_dir: /data/instructlab/datasets
-  # Model to be used for evaluation.
+  # Model to be evaluated
   # Default: None
   model:
   # Multi-turn benchmarking settings for skills.
   mt_bench:
-    # Directory where model to be used as judge is stored.
+    # Judge model for mt_bench and mt_bench_branch.
     # Default: prometheus-eval/prometheus-8x7b-v2.0
     judge_model: prometheus-eval/prometheus-8x7b-v2.0
-    # Number of workers to use for evaluation.
-    # Default: 16
-    max_workers: 16
+    # Number of workers to use for evaluation with mt_bench or mt_bench_branch. Must
+    # be a positive integer or 'auto'.
+    # Default: auto
+    max_workers: auto
     # Directory where evaluation results are stored.
     # Default: /data/instructlab/internal/eval_data
     output_dir: /data/instructlab/internal/eval_data
@@ -83,6 +84,9 @@ general:
   # Debug level for logging.
   # Default: 0
   debug_level: 0
+  # Log format. https://docs.python.org/3/library/logging.html#logrecord-attributes
+  # Default: %(levelname)s %(asctime)s %(name)s:%(lineno)d: %(message)s
+  log_format: '%(levelname)s %(asctime)s %(name)s:%(lineno)d: %(message)s'
   # Log level for logging.
   # Default: INFO
   log_level: INFO
@@ -260,10 +264,21 @@ train:
   # Allow CPU offload for deepspeed optimizer.
   # Default: False
   deepspeed_cpu_offload_optimizer: false
+  # Whether or not we should disable the use of flash-attention during training.
+  # This is useful when using older GPUs.
+  # Default: False
+  disable_flash_attn: false
+  # Pick a distributed training backend framework for GPU accelerated full fine-
+  # tuning.
+  # Default: deepspeed
+  distributed_backend: deepspeed
   # The number of samples in a batch that the model should see before its parameters
   # are updated.
   # Default: 3840
   effective_batch_size: 3840
+  # Allow CPU offload for FSDP optimizer.
+  # Default: False
+  fsdp_cpu_offload_optimizer: false
   # Boolean to indicate if the model being trained is a padding-free transformer
   # model such as Granite.
   # Default: False
@@ -305,9 +320,10 @@ train:
   # Phased phase1 effective batch size.
   # Default: 128
   phased_phase1_effective_batch_size: 128
-  # Number of epochs to run training for during phase1.
-  # Default: 10
-  phased_phase1_num_epochs: 10
+  # Number of epochs to run training for during phase1 (experimentally optimal
+  # number is 7).
+  # Default: 7
+  phased_phase1_num_epochs: 7
   # Number of samples the model should see before saving a checkpoint during phase1.
   # Disabled when set to 0.
   # Default: 0
@@ -325,6 +341,9 @@ train:
   # Number of samples the model should see before saving a checkpoint.
   # Default: 250000
   save_samples: 250000
+  # Optional path to a yaml file that tracks the progress of multiphase training.
+  # Default: None
+  training_journal:
 # Configuration file structure version.
 # Default: 1.0.0
 version: 1.0.0

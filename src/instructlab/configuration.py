@@ -4,6 +4,8 @@
 from os import path
 from re import match
 from typing import Any, Optional, Union
+import enum
+import logging
 import os
 import sys
 import textwrap
@@ -13,6 +15,8 @@ import typing
 # pylint: disable=ungrouped-imports
 from instructlab.training import (
     DeepSpeedOptions,
+    DistributedBackend,
+    FSDPOptions,
     LoraOptions,
     TorchrunArgs,
     TrainingArgs,
@@ -34,7 +38,13 @@ import click
 
 # Local
 from . import log
-from .defaults import CONFIG_VERSION, DEFAULTS, MODEL_FAMILIES, MODEL_FAMILY_MAPPINGS
+from .defaults import (
+    CONFIG_VERSION,
+    DEFAULTS,
+    LOG_FORMAT,
+    MODEL_FAMILIES,
+    MODEL_FAMILY_MAPPINGS,
+)
 
 # Initialize ruamel.yaml
 yaml = YAML()
@@ -54,6 +64,11 @@ class _general(BaseModel):
     # additional fields with defaults
     log_level: StrictStr = Field(default="INFO", description="Log level for logging.")
     debug_level: int = Field(default=0, description="Debug level for logging.")
+    log_format: StrictStr = Field(
+        default=LOG_FORMAT,
+        description="Log format. https://docs.python.org/3/library/logging.html#logrecord-attributes",
+        validate_default=True,
+    )
 
     @field_validator("log_level")
     def validate_log_level(cls, v):
@@ -74,6 +89,19 @@ class _general(BaseModel):
                 f"'{v}' is not a valid log level name. valid levels: {valid_levels}"
             )
         return v.upper()
+
+    @field_validator("log_format")
+    @classmethod
+    def validate_log_format(cls, log_format):
+        try:
+            logging.PercentStyle(log_format).validate()
+            return log_format
+        except ValueError as e:
+            raise ValueError(
+                f"\nFailed to configure log format: {e}\n"
+                "Have you specified a valid log format?\n"
+                "Consider reading: https://docs.python.org/3/library/logging.html#logrecord-attributes"
+            ) from e
 
     @model_validator(mode="after")
     def after_debug_level(self):
@@ -282,15 +310,15 @@ class _mtbench(BaseModel):
 
     judge_model: str = Field(
         default_factory=lambda: DEFAULTS.JUDGE_MODEL_MT,
-        description="Directory where model to be used as judge is stored.",
+        description="Judge model for mt_bench and mt_bench_branch.",
     )
     output_dir: str = Field(
         default_factory=lambda: DEFAULTS.EVAL_DATA_DIR,
         description="Directory where evaluation results are stored.",
     )
-    max_workers: int = Field(
-        default=16,
-        description="Number of workers to use for evaluation.",
+    max_workers: str | int = Field(
+        default="auto",
+        description="Number of workers to use for evaluation with mt_bench or mt_bench_branch. Must be a positive integer or 'auto'.",
     )
 
 
@@ -319,11 +347,11 @@ class _evaluate(BaseModel):
     model_config = ConfigDict(extra="ignore", protected_namespaces=())
     model: Optional[str] = Field(
         default=None,
-        description="Model to be used for evaluation.",
+        description="Model to be evaluated",
     )
     base_model: str = Field(
         default=DEFAULTS.MODEL_REPO,
-        description="Directory where model to be used for evaluation is stored.",
+        description="Base model to compare with 'model' for mt_bench_branch and mmlu_branch.",
     )
     branch: Optional[str] = Field(
         default=None,
@@ -355,7 +383,11 @@ class _train(BaseModel):
     """Class describing configuration of the 'train' sub-command."""
 
     # model configuration
-    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+    model_config = ConfigDict(
+        extra="ignore",
+        protected_namespaces=(),
+        use_enum_values=True,  # populate models with the value property of enums, rather than the raw enum.
+    )
     model_path: str = Field(
         default=DEFAULTS.MODEL_REPO,
         description="Directory where the model to be trained is stored.",
@@ -397,6 +429,14 @@ class _train(BaseModel):
     deepspeed_cpu_offload_optimizer: bool = Field(
         default=False, description="Allow CPU offload for deepspeed optimizer."
     )
+    fsdp_cpu_offload_optimizer: bool = Field(
+        default=False, description="Allow CPU offload for FSDP optimizer."
+    )
+    distributed_backend: DistributedBackend = Field(
+        default=DistributedBackend.DEEPSPEED,
+        description="Pick a distributed training backend framework for GPU accelerated full fine-tuning.",
+        validate_default=True,  # ensures that the 'use_enum_values' flag takes effect on the default value
+    )
     lora_rank: int | None = Field(
         default=4,
         description="Rank of low rank matrices to be used during training.",
@@ -414,6 +454,10 @@ class _train(BaseModel):
         default=1,
         description="Number of GPUs to use for training. This value is not supported in legacy training or MacOS.",
     )
+    disable_flash_attn: Optional[bool] = Field(
+        default=False,
+        description="Whether or not we should disable the use of flash-attention during training. This is useful when using older GPUs.",
+    )
     additional_args: dict[str, typing.Any] = Field(
         default_factory=dict,
         description="Additional arguments to pass to the training script. These arguments are passed as key-value pairs to the training script.",
@@ -423,9 +467,9 @@ class _train(BaseModel):
     # TODO: could move into its own object.
     # Not strictly necessary for a correct training object.
     phased_phase1_num_epochs: int | None = Field(
-        default=10,
+        default=7,
         gt=0,
-        description="Number of epochs to run training for during phase1.",
+        description="Number of epochs to run training for during phase1 (experimentally optimal number is 7).",
     )
     # anything greater than 0 enables samples_per_save for the phase.
     phased_phase1_samples_per_save: int = Field(
@@ -459,6 +503,10 @@ class _train(BaseModel):
     phased_base_dir: str | None = Field(
         default_factory=lambda: DEFAULTS.PHASED_DIR,
         description="Base directory for organization of end-to-end intermediate outputs.",
+    )
+    training_journal: str | None = Field(
+        default=None,
+        description="Optional path to a yaml file that tracks the progress of multiphase training.",
     )
 
 
@@ -800,6 +848,16 @@ SINGLE_A100_H100 = _train(
 )
 
 
+TRAIN_DIR_EXPECTED_FILES = {
+    "A100_H100_x8.yaml",
+    "A100_H100_x4.yaml",
+    "A100_H100_x2.yaml",
+    "L40_x8.yaml",
+    "L40_x4.yaml",
+    "L4_x8.yaml",
+}
+
+
 def get_default_config() -> Config:
     """Generates default configuration for CLI"""
     return Config()
@@ -929,6 +987,9 @@ def config_to_commented_map(
             if default_value is PydanticUndefined:
                 if default_factory is not None and callable(default_factory):
                     default_value = default_factory()
+            # When the default value's type is an Enum or Enum value, convert it to a string
+            elif isinstance(default_value, enum.Enum):
+                default_value = default_value.value
             set_comment(
                 cm, field_name, description, default_value, deprecated, examples, indent
             )
@@ -1084,15 +1145,6 @@ def ensure_storage_directories_exist() -> bool:
 
 # recreate_train_profiles creates all train profiles in the proper directory and takes an argument, overwrite, which will write to the files even if they already exist
 def recreate_train_profiles(overwrite: bool = False) -> bool:
-    TRAIN_DIR_EXPECTED_FILES = {
-        "A100_H100_x8.yaml",
-        "A100_H100_x4.yaml",
-        "A100_H100_x2.yaml",
-        "L40_x8.yaml",
-        "L40_x4.yaml",
-        "L4_x8.yaml",
-    }
-
     fresh_install = False
     profile_dir = os.environ.get(DEFAULTS.ILAB_TRAIN_PROFILE_DIR)
     if profile_dir != "" and profile_dir is not None:
@@ -1203,7 +1255,9 @@ def init(
         log.configure_logging(
             log_level=config_obj.general.log_level.upper(),
             debug_level=config_obj.general.debug_level,
+            fmt=config_obj.general.log_format,
         )
+
         # subtly get the additional args per cfg section
         # if any are missing, add in sane defaults
         train_additional = ctx.default_map["train"]["additional_args"]
@@ -1225,6 +1279,10 @@ def map_train_to_library(ctx, params):
         cpu_offload_optimizer_pin_memory=params[
             "deepspeed_cpu_offload_optimizer_pin_memory"
         ],
+    )
+
+    fsdp_args = FSDPOptions(
+        cpu_offload_params=params["fsdp_cpu_offload_optimizer"],
     )
 
     lora_args = LoraOptions(rank=0)
@@ -1253,7 +1311,11 @@ def map_train_to_library(ctx, params):
         click.secho("LoRA is disabled (rank=0), ignoring all additional LoRA args")
 
     train_args.deepspeed_options = ds_args
+    train_args.fsdp_options = fsdp_args
+    train_args.distributed_backend = DistributedBackend(params["distributed_backend"])
     train_args.lora = lora_args
+    if params["pipeline"] == "full":
+        train_args.disable_flash_attn = True
 
     return train_args, torch_args
 
@@ -1297,52 +1359,91 @@ def storage_dirs_exist() -> bool:
     return all(os.path.exists(dirpath) for dirpath in dirs_to_check)
 
 
+# get_profile_mappings reads the profiles from disk where necessary and returns a mapping of the following format
 # {"GPU Name": ({ "gpu_count": NUM_GPUS, "vram_and_config": {"vram": TOTAL_VRAM, "config": TRAIN_CONFIG}})...}
-PROFILE_MAPPINGS = {
-    "L40s": (
-        {"gpu_count": 1, "vram_and_config": {"vram": 80, "config": SINGLE_L40}},
-        {
-            "gpu_count": 4,
-            "vram_and_config": {"vram": 192, "config": FOUR_L_FORTY_GPU},
-        },
-        {
-            "gpu_count": 8,
-            "vram_and_config": {"vram": 384, "config": EIGHT_L_FORTY_GPU},
-        },
-    ),
-    "L4": (
-        {"gpu_count": 1, "vram_and_config": {"vram": 24, "config": SINGLE_L4}},
-        {
-            "gpu_count": 8,
-            "vram_and_config": {"vram": 192, "config": EIGHT_L_FOUR_GPU},
-        },
-    ),
-    "A100": (
-        {
-            "gpu_count": 2,
-            "vram_and_config": {"vram": 160, "config": TWO_GPU_TRAIN_AH},
-        },
-        {
-            "gpu_count": 4,
-            "vram_and_config": {"vram": 320, "config": FOUR_GPU_TRAIN_AH},
-        },
-        {
-            "gpu_count": 8,
-            "vram_and_config": {"vram": 640, "config": EIGHT_GPU_TRAIN_AH},
-        },
-    ),
-    "H100": (
-        {
-            "gpu_count": 2,
-            "vram_and_config": {"vram": 160, "config": TWO_GPU_TRAIN_AH},
-        },
-        {
-            "gpu_count": 4,
-            "vram_and_config": {"vram": 320, "config": FOUR_GPU_TRAIN_AH},
-        },
-        {
-            "gpu_count": 8,
-            "vram_and_config": {"vram": 640, "config": EIGHT_GPU_TRAIN_AH},
-        },
-    ),
-}
+def get_profile_mappings() -> dict[str, tuple[dict[str, object], ...]]:
+    # read the train cfg from disk, and use what is here to build the mappings.
+    profile_names_and_configs = {}
+    for file in TRAIN_DIR_EXPECTED_FILES:
+        cfg_file = os.path.join(DEFAULTS.TRAIN_PROFILE_DIR, file)
+        train_cfg = read_train_profile(cfg_file)
+        # make a dict mapping file names to train cfgs
+        # we need to do this so that if the user overrode the contents of the profiles using the ENV var, we apply that when auto detecting
+        profile_names_and_configs[file] = train_cfg
+
+    profile_mappings = {
+        "L40s": (
+            {"gpu_count": 1, "vram_and_config": {"vram": 80, "config": SINGLE_L40}},
+            {
+                "gpu_count": 4,
+                "vram_and_config": {
+                    "vram": 192,
+                    "config": profile_names_and_configs["L40_x4.yaml"],
+                },
+            },
+            {
+                "gpu_count": 8,
+                "vram_and_config": {
+                    "vram": 384,
+                    "config": profile_names_and_configs["L40_x8.yaml"],
+                },
+            },
+        ),
+        "L4": (
+            {"gpu_count": 1, "vram_and_config": {"vram": 24, "config": SINGLE_L4}},
+            {
+                "gpu_count": 8,
+                "vram_and_config": {
+                    "vram": 192,
+                    "config": profile_names_and_configs["L4_x8.yaml"],
+                },
+            },
+        ),
+        "A100": (
+            {
+                "gpu_count": 2,
+                "vram_and_config": {
+                    "vram": 160,
+                    "config": profile_names_and_configs["A100_H100_x2.yaml"],
+                },
+            },
+            {
+                "gpu_count": 4,
+                "vram_and_config": {
+                    "vram": 320,
+                    "config": profile_names_and_configs["A100_H100_x4.yaml"],
+                },
+            },
+            {
+                "gpu_count": 8,
+                "vram_and_config": {
+                    "vram": 640,
+                    "config": profile_names_and_configs["A100_H100_x8.yaml"],
+                },
+            },
+        ),
+        "H100": (
+            {
+                "gpu_count": 2,
+                "vram_and_config": {
+                    "vram": 160,
+                    "config": profile_names_and_configs["A100_H100_x2.yaml"],
+                },
+            },
+            {
+                "gpu_count": 4,
+                "vram_and_config": {
+                    "vram": 320,
+                    "config": profile_names_and_configs["A100_H100_x4.yaml"],
+                },
+            },
+            {
+                "gpu_count": 8,
+                "vram_and_config": {
+                    "vram": 640,
+                    "config": profile_names_and_configs["A100_H100_x8.yaml"],
+                },
+            },
+        ),
+    }
+    return profile_mappings

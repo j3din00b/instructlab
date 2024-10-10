@@ -1,118 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from types import FrameType
 from typing import Optional, Tuple
-import json
 import logging
-import multiprocessing
 import pathlib
-import signal
-import struct
 import sys
 
 # Third Party
-from uvicorn import Config
 import click
-import fastapi
-import uvicorn
 
 # Local
 from ...configuration import _serve as serve_config
-from ...utils import split_hostport
+from ...utils import is_model_gguf, is_model_safetensors, split_hostport
 from .common import CHAT_TEMPLATE_AUTO, LLAMA_CPP, VLLM
 from .server import BackendServer
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_BACKENDS = frozenset({LLAMA_CPP, VLLM})
-
-
-class UvicornServer(uvicorn.Server):
-    """Override uvicorn.Server to handle SIGINT."""
-
-    def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
-        if not is_temp_server_running() or sig != signal.SIGINT:
-            super().handle_exit(sig=sig, frame=frame)
-
-
-def is_model_safetensors(model_path: pathlib.Path) -> bool:
-    """Check if model_path is a valid safe tensors directory
-
-    Check if provided path to model represents directory containing a safetensors representation
-    of a model. Directory must contain a specific set of files to qualify as a safetensors model directory
-    Args:
-        model_path (Path): The path to the model directory
-    Returns:
-        bool: True if the model is a safetensors model, False otherwise.
-    """
-    try:
-        files = list(model_path.iterdir())
-    except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
-        logger.debug("Failed to read directory: %s", e)
-        return False
-
-    # directory should contain either .safetensors or .bin files to be considered valid
-    if not any(file.suffix in (".safetensors", ".bin") for file in files):
-        logger.debug("'%s' has no *.safetensors or *.bin files", model_path)
-        return False
-
-    basenames = {file.name for file in files}
-    requires_files = {
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    }
-    diff = requires_files.difference(basenames)
-    if diff:
-        logger.debug("'%s' is missing %s", model_path, diff)
-        return False
-
-    for file in model_path.glob("*.json"):
-        try:
-            with file.open(encoding="utf-8") as f:
-                json.load(f)
-        except (PermissionError, json.JSONDecodeError) as e:
-            logger.debug("'%s' is not a valid JSON file: e", file, e)
-            return False
-
-    # TODO: add check for safetensors file header (?)
-    return True
-
-
-def is_model_gguf(model_path: pathlib.Path) -> bool:
-    """
-    Check if the file is a GGUF file.
-    Args:
-        model_path (Path): The path to the file.
-    Returns:
-        bool: True if the file is a GGUF file, False otherwise.
-    """
-    # Third Party
-    from gguf.constants import GGUF_MAGIC
-
-    try:
-        with model_path.open("rb") as f:
-            first_four_bytes = f.read(4)
-
-        # Convert the first four bytes to an integer
-        first_four_bytes_int = int(struct.unpack("<I", first_four_bytes)[0])
-
-        return first_four_bytes_int == GGUF_MAGIC
-    except struct.error as exc:
-        logger.debug(
-            f"Failed to unpack the first four bytes of {model_path}. "
-            f"The file might not be a valid GGUF file or is corrupted: {exc}"
-        )
-        return False
-    except IsADirectoryError as exc:
-        logger.debug(f"GGUF Path {model_path} is a directory, returning {exc}")
-        return False
-    except OSError as exc:
-        logger.debug(
-            f"An unexpected error occurred while processing {model_path}: {exc}"
-        )
-        return False
 
 
 def determine_backend(model_path: pathlib.Path) -> Tuple[str, str]:
@@ -200,30 +105,17 @@ def get(model_path: pathlib.Path, backend: str | None) -> str:
     return backend
 
 
-def is_temp_server_running():
-    """Check if the temp server is running."""
-    return multiprocessing.current_process().name != "MainProcess"
-
-
-def get_uvicorn_config(app: fastapi.FastAPI, host: str, port: int) -> Config:
-    return Config(
-        app,
-        host=host,
-        port=port,
-        log_level=logging.ERROR,
-        limit_concurrency=2,  # Make sure we only serve a single client at a time
-        timeout_keep_alive=0,  # prevent clients holding connections open (we only have 1)
-    )
-
-
 def select_backend(
     cfg: serve_config,
     backend: Optional[str] = None,
     model_path: pathlib.Path | None = None,
+    log_file: pathlib.Path | None = None,
 ) -> BackendServer:
     # Local
     from .llama_cpp import Server as llama_cpp_server
     from .vllm import Server as vllm_server
+
+    logger.debug("Selecting backend for model %s", model_path)
 
     model_path = pathlib.Path(model_path or cfg.model_path)
     backend_name = backend if backend is not None else cfg.backend
@@ -250,6 +142,7 @@ def select_backend(
             model_family=cfg.llama_cpp.llm_family,
             host=host,
             port=port,
+            log_file=log_file,
         )
     if backend == VLLM:
         # Instantiate the vllm server
@@ -262,6 +155,7 @@ def select_backend(
             host=host,
             port=port,
             max_startup_attempts=cfg.vllm.max_startup_attempts,
+            log_file=log_file,
         )
     click.secho(f"Unknown backend: {backend}", fg="red")
     raise click.exceptions.Exit(1)

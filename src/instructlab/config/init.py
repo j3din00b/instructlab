@@ -15,11 +15,11 @@ import click
 from instructlab import clickext, utils
 from instructlab.configuration import (
     DEFAULTS,
-    PROFILE_MAPPINGS,
     Config,
     _train,
     ensure_storage_directories_exist,
     get_default_config,
+    get_profile_mappings,
     read_config,
     read_train_profile,
     recreate_train_profiles,
@@ -220,13 +220,14 @@ def hw_auto_detect() -> tuple[str | None, int | None, _train, bool]:
     gpu_name = ""
     edited_cfg = False
     # try nvidia
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and torch.version.hip is None:
         click.echo("Detecting Hardware...")
         gpus = torch.cuda.device_count()
         for i in range(gpus):
             properties = torch.cuda.get_device_properties(i)
             gpu_name = properties.name
             total_vram += properties.total_memory  # memory in B
+
     vram = int(floor(convert_bytes_to_proper_mag(total_vram)[0]))
     if vram == 0:
         return None, None, train, False
@@ -245,7 +246,7 @@ def hw_auto_detect() -> tuple[str | None, int | None, _train, bool]:
 def lookup_card(
     gpu_name, gpu_count, vram
 ) -> tuple[bool, int | None, str | None, _train]:
-    profiles = PROFILE_MAPPINGS
+    profiles = get_profile_mappings()
     card_entry = profiles.get(gpu_name)
     chosen_profile_name = None
     if card_entry is not None:
@@ -268,7 +269,8 @@ def match_profile_based_on_vram(vram) -> tuple[int | None, str | None, _train]:
     chosen_profile_name = None
     chosen_vram = None
     train = _train()
-    for group_gpu_name, list_of_count_vram_and_config in PROFILE_MAPPINGS.items():
+    profiles = get_profile_mappings()
+    for group_gpu_name, list_of_count_vram_and_config in profiles.items():
         for gpu_count_configs in list_of_count_vram_and_config:
             if (
                 not isinstance(gpu_count_configs["gpu_count"], int)
@@ -325,7 +327,7 @@ def check_if_configs_exist(fresh_install) -> bool:
             raise click.exceptions.Exit(0)
     if exists(DEFAULTS.TRAIN_PROFILE_DIR) and not fresh_install:
         return click.confirm(
-            f"Existing training profiles were found in {DEFAULTS.TRAIN_PROFILE_DIR}\nDo you also want to restore these profiles to the default values?"
+            f"Existing training profiles were found in {DEFAULTS.TRAIN_PROFILE_DIR}\nDo you want to restore these profiles to the default values?"
         )
     # default behavior should be do NOT overwrite files that could have just been created
     return False

@@ -19,6 +19,29 @@ set -ex
 #############
 # UTILITIES #
 #############
+init_config() {
+    # Generate initial configuration file
+    ilab config init --non-interactive
+
+    # It looks like GitHub action MacOS runner does not have graphics
+    # so we need to disable the GPU layers if we are running in GitHub actions
+    if [[ "$(uname)" == "Darwin" ]]; then
+        if command -v system_profiler; then
+            if system_profiler SPDisplaysDataType|grep "Metal Support"; then
+                echo "Metal GPU detected"
+            else
+                echo "No Metal GPU detected"
+                sed -i.bak -e 's/gpu_layers: -1/gpu_layers: 0/g;' "${ILAB_CONFIG_FILE}"
+            fi
+        else
+            echo "system_profiler not found, cannot determine GPU"
+        fi
+    fi
+
+    # Enable Debug in func tests with debug level 1
+    sed -i.bak -e 's/log_level:.*/log_level: DEBUG/g;' "${ILAB_CONFIG_FILE}"
+    sed -i.bak -e 's/debug_level:.*/debug_level: 1/g;' "${ILAB_CONFIG_FILE}"
+}
 
 cleanup() {
     set +e
@@ -41,16 +64,15 @@ cleanup() {
         "$TEST_CTX_SIZE_LAB_CHAT_LOG_FILE" \
         test_session_history
     rm -rf test_taxonomy
-    # revert port change from test_bind_port()
-    sed -i.bak 's/9999/8000/g' "${ILAB_CONFIG_FILE}"
 
     # revert model name change from test_model_print()
-    local original_model_name='merlinite-7b-lab-Q4_K_M'
-    local original_model_filename="${original_model_name}.gguf"
+    local original_model_filename="merlinite-7b-lab-Q4_K_M.gguf"
     local temporary_model_filename='foo.gguf'
-    sed -i.bak "s/baz/${original_model_name}/g" "${ILAB_CONFIG_FILE}"
     mv "${ILAB_CACHE_DIR}/models/${temporary_model_filename}" "${ILAB_CACHE_DIR}/models/${original_model_filename}" || true
-    rm -f "${ILAB_CONFIG_FILE}.bak" serve.log "${ILAB_CACHE_DIR}/models/${temporary_model_filename}"
+    rm -f "${ILAB_CONFIG_FILE}.bak" serve.log "${ILAB_CACHE_DIR}/models/${temporary_model_filename}" chat.log
+
+    # reset config file and re-init defaults
+    init_config
     set -e
 }
 
@@ -131,6 +153,7 @@ wait_for_server(){
         exit 1
     fi
 }
+
 
 #########
 # TESTS #
@@ -213,11 +236,11 @@ test_ctx_size(){
     wait_for_server
 
     # SHOULD SUCCEED: ilab model chat will trim the SYS_PROMPT then take the second message
-    ${chat_shot} "Hello"
+    "${chat_shot[@]}" "Hello"
 
     # SHOULD FAIL: ilab model chat will trim the SYS_PROMPT AND the second message, then raise an error
     # The errors from failures will be written into the serve log and chat log files
-    ${chat_shot} "hello, I am a ci message that should not finish because I am too long for the context window, tell me about your day please?
+    "${chat_shot[@]}" "hello, I am a ci message that should not finish because I am too long for the context window, tell me about your day please?
     How many tokens could you take today. Could you tell me about the time you could only take twenty five tokens" &> "$TEST_CTX_SIZE_LAB_CHAT_LOG_FILE" &
     PID_CHAT=$!
 
@@ -396,9 +419,38 @@ test_server_welcome_message(){
 
     if ! timeout 10 bash -c '
         until test -s serve.log; do
-        echo "waiting for server log file to be created"
-        sleep 1
-    done
+            echo "waiting for server log file to be created"
+            sleep 1
+        done
+        if ! grep instructlab.model.backends.llama_cpp serve.log; then
+            echo "server log file does not contain serving message"
+            exit 1
+        else
+            cat serve.log
+        fi
+    '; then
+        echo "server log file was not created"
+        exit 1
+    fi
+}
+
+test_log_format(){
+    # remove the log 'levelname' from the log format
+    sed -i.bak -e 's/log_format:.*/log_format: "%(name)s:%(lineno)d: %(message)s"/g' "${ILAB_CONFIG_FILE}"
+    ilab model serve &> serve.log &
+    PID_SERVE=$!
+
+    wait_for_server
+
+    if ! timeout 10 bash -c '
+        until test -s serve.log; do
+            echo "waiting for server log file to be created"
+            sleep 1
+        done
+        if grep INFO serve.log; then
+            echo "INFO log level found in server log - wrong log format"
+            exit 1
+        fi
     '; then
         echo "server log file was not created"
         exit 1
@@ -501,6 +553,29 @@ test_server_chat_template() {
     test_server_template_value "$SCRIPTDIR/test-data/mock-template.txt" 3
 }
 
+test_ilab_chat_server_logs(){
+    sed -i.bak '/max_ctx_size: 4096/s/4096/1/' "${ILAB_CONFIG_FILE}"
+
+    chat_shot+=("--serving-log-file" "chat.log")
+    "${chat_shot[@]}" "Hello"
+
+    if ! timeout 3 bash -c '
+        until test -s chat.log; do
+            echo "waiting for chat log file to be created"
+            sleep 1
+        done
+        if ! grep "exceed context window of" chat.log; then
+            echo "chat log file does not contain serving message"
+            exit 1
+        else
+            cat chat.log
+        fi
+    '; then
+        echo "chat log file was not created"
+        exit 1
+    fi
+}
+
 #########
 # SETUP #
 #########
@@ -545,7 +620,7 @@ done
 PID_SERVE=
 PID_CHAT=
 
-chat_shot="ilab model chat -qq"
+chat_shot=("ilab" "model" "chat" "-qq")
 
 init_test_script
 trap 'cleanup "${?}"; test -z "${TEST_DIR_SET_BY_CALLER}" && rm -rf "${TEST_DIR}"' EXIT QUIT INT TERM
@@ -558,27 +633,8 @@ ilab --version
 # print system information
 ilab system info
 
-# pipe 3 carriage returns to ilab config init to get past the prompts
-echo -e "\n\n\n" | ilab config init
-
-# Enable Debug in func tests with debug level 1
-sed -i.bak -e 's/log_level:.*/log_level: DEBUG/g;' "${ILAB_CONFIG_FILE}"
-sed -i.bak -e 's/debug_level:.*/debug_level: 1/g;' "${ILAB_CONFIG_FILE}"
-
-# It looks like GitHub action MacOS runner does not have graphics
-# so we need to disable the GPU layers if we are running in GitHub actions
-if [[ "$(uname)" == "Darwin" ]]; then
-    if command -v system_profiler; then
-        if system_profiler SPDisplaysDataType|grep "Metal Support"; then
-            echo "Metal GPU detected"
-        else
-            echo "No Metal GPU detected"
-            sed -i.bak -e 's/gpu_layers: -1/gpu_layers: 0/g;' "${ILAB_CONFIG_FILE}"
-        fi
-    else
-        echo "system_profiler not found, cannot determine GPU"
-    fi
-fi
+# initialize the configuration file
+init_config
 
 # download the latest version of the ilab
 ilab model download
@@ -587,6 +643,8 @@ ilab model download
 # MAIN #
 ########
 # call cleanup in-between each test so they can run without conflicting with the server/chat process
+test_ilab_chat_server_logs
+cleanup
 test_oci_model_download_with_vllm_backend
 cleanup
 test_bind_port
@@ -612,5 +670,7 @@ cleanup
 test_server_welcome_message
 cleanup
 test_model_print
+cleanup
+test_log_format
 
 exit 0

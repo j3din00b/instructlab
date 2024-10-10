@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-name: E2E (NVIDIA A10G x4)
+name: E2E (NVIDIA L40S x4)
 
 on:
   schedule:
@@ -32,9 +32,9 @@ jobs:
         with:
           mode: start
           github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
-          ec2-image-id: ami-03f6686697972e40a
-          ec2-instance-type: g5.12xlarge
-          subnet-id: subnet-02d230cffd9385bd4
+          ec2-image-id: ami-01a89eee1adde309c
+          ec2-instance-type: g6e.12xlarge
+          subnet-id: subnet-024298cefa3bedd61
           security-group-id: sg-06300447c4a5fbef3
           iam-role-name: instructlab-ci-runner
           aws-resource-tags: >
@@ -55,7 +55,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
         with:
            # https://github.com/actions/checkout/issues/249
           fetch-depth: 0
@@ -138,17 +138,16 @@ jobs:
           python3.11 -m pip install packaging wheel setuptools-scm
           python3.11 -m pip install .[cuda] -r requirements-vllm-cuda.txt
 
-      - name: ilab system info
+      - name: Check disk
         run: |
-          . venv/bin/activate
-          ilab system info
+          df -h
 
       - name: Run e2e test
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           . venv/bin/activate
-          ./scripts/basic-workflow-tests.sh -mevFMT
+          ./scripts/e2e.sh -l
 
       - name: Add comment to PR if the workflow failed
         if: failure() && steps.check_pr.outputs.is_pr == 'true'
@@ -173,7 +172,7 @@ jobs:
           # See also: https://api.slack.com/methods/chat.postMessage#channels
           # You can pass in multiple channels to post to by providing a comma-delimited list of channel IDs.
           channel-id: 'cli-e2e-results'
-          slack-message: "*e2e-nvidia-a10g-x4* job in *${{ github.repository }}* running on branch `${{ steps.check_pr.outputs.pr_or_branch }}` completed *with failures* :meow_sad-rain: | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          slack-message: "*e2e-nvidia-l40s-x4* job in *${{ github.repository }}* running on branch `${{ steps.check_pr.outputs.pr_or_branch }}` completed *with failures* :meow_sad-rain: | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SON_OF_JEEVES_TOKEN }}
 
@@ -186,7 +185,7 @@ jobs:
           # See also: https://api.slack.com/methods/chat.postMessage#channels
           # You can pass in multiple channels to post to by providing a comma-delimited list of channel IDs.
           channel-id: 'cli-e2e-results'
-          slack-message: "*e2e-nvidia-a10g-x4* job in *${{ github.repository }}* running on branch `${{ steps.check_pr.outputs.pr_or_branch }}` completed *successfully* :meow_party: | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          slack-message: "*e2e-nvidia-l40s-x4* job in *${{ github.repository }}* running on branch `${{ steps.check_pr.outputs.pr_or_branch }}` completed *successfully* :meow_party: | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SON_OF_JEEVES_TOKEN }}
 

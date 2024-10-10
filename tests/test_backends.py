@@ -15,6 +15,7 @@ import pytest
 from instructlab import lab
 from instructlab.model.backends import backends, common
 from instructlab.model.backends.vllm import build_vllm_cmd
+from instructlab.utils import is_model_safetensors
 
 
 # helper function to create dummy valid and invalid safetensor or bin model directories
@@ -106,7 +107,7 @@ def test_is_model_safetensors_or_bin_valid(
     model_path = tmp_path / model_dir
     create_safetensors_or_bin_model_files(model_path, model_file_type, expected)
 
-    val = backends.is_model_safetensors(model_path)
+    val = is_model_safetensors(model_path)
     assert val == expected
 
 
@@ -195,13 +196,25 @@ def test_ilab_vllm_args(
         vllm_args=["--enable_lora"],
         host="127.0.0.1",
         port=8000,
+        log_file=None,
     )
 
 
+@pytest.mark.parametrize(
+    "log_file_flag, expected_log_file",
+    [
+        (None, None),
+        ("--log-file", pathlib.Path("test.log")),
+    ],
+)
 @mock.patch("instructlab.model.backends.llama_cpp.Server")
 @mock.patch("instructlab.model.backends.backends.get", return_value=backends.LLAMA_CPP)
 def test_ilab_llama_cpp_args(
-    m_backends_get: mock.Mock, m_server: mock.Mock, cli_runner: CliRunner
+    m_backends_get: mock.Mock,
+    m_server: mock.Mock,
+    cli_runner: CliRunner,
+    log_file_flag,
+    expected_log_file,
 ):
     gguf = pathlib.Path("test.gguf")
     cmd = [
@@ -214,6 +227,9 @@ def test_ilab_llama_cpp_args(
         "--backend",
         backends.LLAMA_CPP,
     ]
+    if log_file_flag:
+        cmd.extend([log_file_flag, str(expected_log_file)])
+
     result = cli_runner.invoke(lab.ilab, cmd)
     assert result.exit_code == 0, result.stdout
     m_backends_get.assert_called_once_with(gguf, backends.LLAMA_CPP)
@@ -227,6 +243,7 @@ def test_ilab_llama_cpp_args(
         max_ctx_size=4096,
         num_threads=None,
         chat_template=None,
+        log_file=expected_log_file,
     )
 
 

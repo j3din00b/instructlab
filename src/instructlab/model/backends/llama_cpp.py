@@ -1,24 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from contextlib import redirect_stderr
 from time import sleep
+from types import FrameType
 from typing import Optional, cast
 import logging
 import multiprocessing
 import pathlib
+import signal
 
 # Third Party
 from llama_cpp import llama_chat_format, llama_token_get_text
 from llama_cpp.server.app import create_app
 from llama_cpp.server.model import LlamaProxy
 from llama_cpp.server.settings import Settings
+from uvicorn import Config
+import fastapi
 import httpx
 import llama_cpp.server.app as llama_app
+import uvicorn
 
 # Local
 from ...client import check_api_base
 from ...configuration import get_api_base
-from .backends import UvicornServer, get_uvicorn_config
 from .common import (
     API_ROOT_WELCOME_MESSAGE,
     CHAT_TEMPLATE_AUTO,
@@ -27,9 +32,10 @@ from .common import (
     ServerException,
     free_tcp_ipv4_port,
     get_model_template,
+    is_temp_server_running,
     verify_template_exists,
 )
-from .server import BackendServer
+from .server import BackendServer, ServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +52,17 @@ class Server(BackendServer):
         gpu_layers: int,
         max_ctx_size: int,
         num_threads: Optional[int],
+        log_file: Optional[pathlib.Path] = None,
     ):
-        super().__init__(model_family, model_path, chat_template, api_base, host, port)
+        sc = ServerConfig(api_base, log_file)
+        super().__init__(
+            model_family,
+            model_path,
+            chat_template,
+            host,
+            port,
+            sc,
+        )
         self.gpu_layers = gpu_layers
         self.max_ctx_size = max_ctx_size
         self.num_threads = num_threads
@@ -66,6 +81,8 @@ class Server(BackendServer):
                 threads=self.num_threads,
                 host=self.host,
                 port=self.port,
+                log_file=self.config.log_file,
+                log_level=logger.getEffectiveLevel(),
             )
         except ServerException as exc:
             raise exc
@@ -74,6 +91,12 @@ class Server(BackendServer):
         mpctx = multiprocessing.get_context(None)
         self.queue = mpctx.Queue()
 
+        # When using the multiprocessing module, each new process starts with a fresh copy of
+        # the parent process's state, but it does not inherit the state of the logging configuration.
+        # This means that any logging configuration set up in the parent process (such as log levels,
+        # handlers, etc.) will not be automatically applied to the child processes.
+        # That's why we pass the log_level parameter to the server function and set the log level
+        # We only do this when called from run_detached
         server_process = mpctx.Process(
             target=server,
             kwargs={
@@ -85,6 +108,8 @@ class Server(BackendServer):
                 "port": port,
                 "host": self.host,
                 "queue": self.queue,
+                "log_file": self.config.log_file,
+                "log_level": logger.getEffectiveLevel(),
             },
         )
 
@@ -97,9 +122,9 @@ class Server(BackendServer):
         foreground_allowed: bool = False,
         max_startup_retries: int = 0,
     ) -> str:
-        logger.info(f"Trying to connect to model server at {self.api_base}")
-        if check_api_base(self.api_base, http_client):
-            return self.api_base
+        logger.info(f"Trying to connect to model server at {self.config.api_base}")
+        if check_api_base(self.config.api_base, http_client):
+            return self.config.api_base
         try:
             self.port = free_tcp_ipv4_port(self.host)
             # start new server
@@ -157,20 +182,38 @@ def server(
     host: str = "localhost",
     port: int = 8000,
     queue: Optional[multiprocessing.Queue] = None,
+    log_file: Optional[pathlib.Path] = None,
+    log_level: int = logging.INFO,
 ):
     """Start OpenAI-compatible server"""
+    verbose = log_level == logging.DEBUG
     settings = Settings(
         host=host,
         port=port,
         model=model_path.as_posix(),
         n_ctx=max_ctx_size,
         n_gpu_layers=gpu_layers,
-        verbose=logger.isEnabledFor(logging.DEBUG),
+        verbose=verbose,
     )
+
     if threads is not None:
         settings.n_threads = threads
     try:
-        app = create_app(settings=settings)
+        # When we run a logger with DEBUG, verbose mode is activated, create_app will initialize the Llama class which
+        # will print the model configuration to stderr. We need to redirect stderr to the log_file
+        # if specified.
+        # We don't need to redirect if verbose is not true, since there will be nothing to redirect.
+        if verbose and log_file:
+            # We can't redirect to the logger here because we might end up in a RecursionError. It
+            # is likely caused by the logger itself writing to stderr, which is being redirected to
+            # the logger, creating a recursive loop.
+            with (
+                open(log_file, "a", encoding="utf-8") as f,
+                redirect_stderr(f),
+            ):
+                app = create_app(settings=settings)
+        else:
+            app = create_app(settings=settings)
 
         @app.get("/")
         def read_root():
@@ -191,6 +234,7 @@ def server(
         f"After application startup complete see http://{host}:{port}/docs for API."
     )
 
+    # Build server's configuration
     config = get_uvicorn_config(
         app=app,
         host=host,
@@ -198,11 +242,40 @@ def server(
     )
     s = UvicornServer(config)
 
-    s.run()
+    # If this is not the main process, this is the temp server process that ran in the background
+    # after `ilab model chat` was executed.
+    # In this case, we want to redirect stdout to null to avoid cluttering the chat with messages
+    # returned by the server.
+    # Redirect stderr to log file if specified
+    if log_file:
+        with open(log_file, "a", encoding="utf-8") as f, redirect_stderr(f):
+            # Start the server
+            s.run()
+    else:
+        s.run()
 
     if queue:
         queue.close()
         queue.join_thread()
+
+
+def get_uvicorn_config(app: fastapi.FastAPI, host: str, port: int) -> Config:
+    return Config(
+        app,
+        host=host,
+        port=port,
+        log_level=logging.ERROR,
+        limit_concurrency=2,  # Make sure we only serve a single client at a time
+        timeout_keep_alive=0,  # prevent clients holding connections open (we only have 1)
+    )
+
+
+class UvicornServer(uvicorn.Server):
+    """Override uvicorn.Server to handle SIGINT."""
+
+    def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
+        if not is_temp_server_running() or sig != signal.SIGINT:
+            super().handle_exit(sig=sig, frame=frame)
 
 
 def augment_chat_template(
